@@ -14,6 +14,7 @@ import json
 import asyncio
 import aiohttp
 import time
+import random
 from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
@@ -33,10 +34,10 @@ class DependencyInfo:
     dependency_type: Optional[str] = None  # e.g., "maven", "npm", "pip"
 
 class AsyncCodacyAPIClient:
-    """Async client for interacting with the Codacy API with performance optimizations"""
+    """Async client for interacting with the Codacy API with performance optimizations and rate limiting"""
     
     def __init__(self, api_token: str, base_url: str = "https://app.codacy.com/api/v3",
-                 max_concurrent: int = 10, request_timeout: int = 30):
+                 max_concurrent: int = 5, request_timeout: int = 30):
         self.api_token = api_token
         self.base_url = base_url
         self.max_concurrent = max_concurrent
@@ -48,9 +49,17 @@ class AsyncCodacyAPIClient:
         self.cache = {}
         self.cache_ttl = 300  # 5 minutes
         
+        # Rate limiting (2500 requests per 5 minutes = ~8.3 requests per second)
+        self.rate_limit_requests = 2400  # Leave some buffer
+        self.rate_limit_window = 300  # 5 minutes
+        self.request_times = []
+        self.rate_limit_lock = asyncio.Lock()
+        
         # Performance metrics
         self.request_count = 0
         self.cache_hits = 0
+        self.rate_limit_delays = 0
+        self.retry_count = 0
         self.start_time = time.time()
     
     async def __aenter__(self):
@@ -92,9 +101,92 @@ class AsyncCodacyAPIClient:
         """Check if cache entry is still valid"""
         return time.time() - timestamp < self.cache_ttl
     
+    async def _wait_for_rate_limit(self):
+        """Wait if we're approaching rate limits"""
+        async with self.rate_limit_lock:
+            current_time = time.time()
+            
+            # Remove old requests outside the window
+            self.request_times = [t for t in self.request_times if current_time - t < self.rate_limit_window]
+            
+            # Check if we need to wait
+            if len(self.request_times) >= self.rate_limit_requests:
+                # Calculate how long to wait
+                oldest_request = min(self.request_times)
+                wait_time = self.rate_limit_window - (current_time - oldest_request)
+                
+                if wait_time > 0:
+                    self.rate_limit_delays += 1
+                    click.echo(f"Rate limit reached, waiting {wait_time:.1f} seconds...")
+                    await asyncio.sleep(wait_time)
+            
+            # Record this request
+            self.request_times.append(current_time)
+
+    async def _make_request_with_retry(self, method: str, url: str, params: dict = None, 
+                                     json_data: dict = None, max_retries: int = 3) -> dict:
+        """Make HTTP request with exponential backoff retry for rate limit errors"""
+        for attempt in range(max_retries + 1):
+            try:
+                # Wait for rate limit before making request
+                await self._wait_for_rate_limit()
+                
+                if method.upper() == "GET":
+                    async with self.session.get(url, params=params) as response:
+                        if response.status == 502:  # Bad Gateway - likely rate limit
+                            raise aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=502,
+                                message="Bad Gateway - Rate limit"
+                            )
+                        response.raise_for_status()
+                        return await response.json()
+                        
+                elif method.upper() == "POST":
+                    async with self.session.post(url, params=params, json=json_data) as response:
+                        if response.status == 502:  # Bad Gateway - likely rate limit
+                            raise aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=502,
+                                message="Bad Gateway - Rate limit"
+                            )
+                        response.raise_for_status()
+                        return await response.json()
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                    
+            except aiohttp.ClientResponseError as e:
+                if e.status == 502 and attempt < max_retries:
+                    # Exponential backoff with jitter for 502 errors
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    self.retry_count += 1
+                    click.echo(f"Request failed with 502 (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    click.echo(f"Request failed for {url}: {e.status}, message='{e.message}'", err=True)
+                    return {}
+            except aiohttp.ClientError as e:
+                click.echo(f"Request failed for {url}: {e}", err=True)
+                return {}
+            except asyncio.TimeoutError:
+                if attempt < max_retries:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    self.retry_count += 1
+                    click.echo(f"Request timeout (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    click.echo(f"Request timeout for {url}", err=True)
+                    return {}
+        
+        return {}
+
     async def _make_request(self, method: str, url: str, params: dict = None, 
                            json_data: dict = None, use_cache: bool = True) -> dict:
-        """Make HTTP request with caching and concurrency control"""
+        """Make HTTP request with caching, concurrency control, and rate limiting"""
         cache_key = self._get_cache_key(url, params, json_data)
         
         # Check cache first
@@ -107,30 +199,14 @@ class AsyncCodacyAPIClient:
         async with self.semaphore:  # Control concurrency
             self.request_count += 1
             
-            try:
-                if method.upper() == "GET":
-                    async with self.session.get(url, params=params) as response:
-                        response.raise_for_status()
-                        data = await response.json()
-                elif method.upper() == "POST":
-                    async with self.session.post(url, params=params, json=json_data) as response:
-                        response.raise_for_status()
-                        data = await response.json()
-                else:
-                    raise ValueError(f"Unsupported HTTP method: {method}")
-                
-                # Cache the response
-                if use_cache:
-                    self.cache[cache_key] = (data, time.time())
-                
-                return data
-                
-            except aiohttp.ClientError as e:
-                click.echo(f"Request failed for {url}: {e}", err=True)
-                return {}
-            except asyncio.TimeoutError:
-                click.echo(f"Request timeout for {url}", err=True)
-                return {}
+            # Make request with retry logic
+            data = await self._make_request_with_retry(method, url, params, json_data)
+            
+            # Cache the response if successful
+            if data and use_cache:
+                self.cache[cache_key] = (data, time.time())
+            
+            return data
     
     async def get_organization_repositories(self, provider: str, organization: str) -> List[Dict[str, Any]]:
         """Get all repositories for an organization"""
@@ -253,6 +329,8 @@ class AsyncCodacyAPIClient:
             "total_requests": self.request_count,
             "cache_hits": self.cache_hits,
             "cache_hit_rate": f"{cache_hit_rate:.1f}%",
+            "rate_limit_delays": self.rate_limit_delays,
+            "retry_attempts": self.retry_count,
             "elapsed_time": f"{elapsed_time:.2f}s",
             "requests_per_second": f"{self.request_count / max(elapsed_time, 1):.2f}"
         }
@@ -534,7 +612,7 @@ class AsyncDependencyReporter:
               help="Output format")
 @click.option("--output-file", help="Output file path (default: stdout)")
 @click.option("--limit", "-l", type=int, help="Limit the number of dependencies to process (useful for testing)")
-@click.option("--max-concurrent", type=int, default=10, help="Maximum concurrent requests (default: 10)")
+@click.option("--max-concurrent", type=int, default=5, help="Maximum concurrent requests (default: 5, reduced for rate limiting)")
 @click.option("--batch-size", type=int, default=50, help="Dependencies to process per batch (default: 50)")
 @click.option("--request-timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
 @click.option("--show-stats", is_flag=True, help="Show performance statistics")
@@ -605,6 +683,8 @@ def main(provider: str, organization: str, api_token: Optional[str],
                 click.echo(f"Total API requests: {stats['total_requests']}")
                 click.echo(f"Cache hits: {stats['cache_hits']}")
                 click.echo(f"Cache hit rate: {stats['cache_hit_rate']}")
+                click.echo(f"Rate limit delays: {stats['rate_limit_delays']}")
+                click.echo(f"Retry attempts: {stats['retry_attempts']}")
                 click.echo(f"Requests per second: {stats['requests_per_second']}")
                 click.echo(f"Dependencies found: {len(dependencies)}")
                 

@@ -30,6 +30,8 @@ Based on the optimization techniques implemented:
 4. **Batch Processing**: Dependencies are processed in configurable batches
 5. **Connection Pooling**: HTTP connections are reused for better performance
 6. **Smart File Pattern Matching**: Multiple file patterns are searched concurrently
+7. **Rate Limiting Protection**: Built-in rate limiting (2400 requests per 5 minutes) with automatic delays
+8. **Exponential Backoff**: Automatic retry with exponential backoff for 502 errors and timeouts
 
 ## Installation
 
@@ -70,7 +72,7 @@ python dependency_reporter_async.py \
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--max-concurrent` | 10 | Maximum concurrent API requests |
+| `--max-concurrent` | 5 | Maximum concurrent API requests (reduced for rate limiting) |
 | `--batch-size` | 50 | Dependencies to process per batch |
 | `--request-timeout` | 30 | Request timeout in seconds |
 | `--show-stats` | False | Show detailed performance statistics |
@@ -86,6 +88,8 @@ Total execution time: 45.23s
 Total API requests: 1,247
 Cache hits: 312
 Cache hit rate: 25.0%
+Rate limit delays: 2
+Retry attempts: 8
 Requests per second: 27.58
 Dependencies found: 156
 Total dependency usages: 1,089
