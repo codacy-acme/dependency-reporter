@@ -9,9 +9,12 @@ A Python utility to scan Codacy organizations for dependencies and generate repo
 - Shows which repositories use each dependency with specific file paths
 - Detects dependencies across multiple package managers (npm, Maven, pip, Gradle, etc.)
 - Provides dependency versions and types
-- Supports multiple output formats (JSON, text)
+- Supports multiple output formats (JSON, CSV, text)
 - Command-line interface with flexible options
 - File-level dependency mapping for precise location tracking
+- Asynchronous processing for improved performance
+- License information retrieval with caching
+- Rate limiting and retry mechanisms
 
 ## Prerequisites
 
@@ -43,45 +46,64 @@ cp .env.example .env
 ### Basic Usage
 
 ```bash
-python dependency_reporter.py -o your-organization-name
+python dependency_reporter_async.py --provider gh --organization your-organization-name
 ```
 
 ### With API Token
 
 ```bash
-python dependency_reporter.py -o your-organization-name -t your_api_token
+python dependency_reporter_async.py --provider gh --organization your-organization-name --api-token your_api_token
 ```
 
 ### Different Output Formats
 
 ```bash
+# CSV output
+python dependency_reporter_async.py --provider gh --organization your-org --output csv
+
 # JSON output
-python dependency_reporter.py -o your-org -f json
+python dependency_reporter_async.py --provider gh --organization your-org --output json
 
 # Save to file
-python dependency_reporter.py -o your-org -f json --output-file dependencies.json
+python dependency_reporter_async.py --provider gh --organization your-org --output csv --output-file dependencies.csv
 ```
 
 ### Different Git Providers
 
 ```bash
 # GitHub (default)
-python dependency_reporter.py -p gh -o your-org
+python dependency_reporter_async.py --provider gh --organization your-org
 
 # GitLab
-python dependency_reporter.py -p gl -o your-org
+python dependency_reporter_async.py --provider gl --organization your-org
 
 # Bitbucket
-python dependency_reporter.py -p bb -o your-org
+python dependency_reporter_async.py --provider bb --organization your-org
+```
+
+### Additional Options
+
+```bash
+# Limit number of dependencies processed
+python dependency_reporter_async.py --provider gh --organization your-org --limit 10
+
+# Show performance statistics
+python dependency_reporter_async.py --provider gh --organization your-org --show-stats
+
+# Disable license caching
+python dependency_reporter_async.py --provider gh --organization your-org --no-cache
 ```
 
 ## Command Line Options
 
-- `-p, --provider`: Git provider (gh, gl, bb) - default: gh
-- `-o, --organization`: Organization name (required)
-- `-t, --api-token`: Codacy API token (or set CODACY_API_TOKEN env var)
-- `-f, --output`: Output format (json, text) - default: text
+- `--provider`: Git provider (gh, gl, bb) - default: gh
+- `--organization`: Organization name (required)
+- `--api-token`: Codacy API token (or set CODACY_API_TOKEN env var)
+- `--output`: Output format (json, csv, text) - default: text
 - `--output-file`: Output file path (default: stdout)
+- `--limit`: Limit number of dependencies to process
+- `--show-stats`: Show performance statistics
+- `--no-cache`: Disable license caching
 
 ## API Token Setup
 
@@ -95,78 +117,75 @@ python dependency_reporter.py -p bb -o your-org
 
 ## Sample Output
 
+### CSV Format
+```csv
+Dependency Name,Version,Type,License Name,Repository,File Path
+npm/lodash,4.17.21,npm,MIT License,frontend-app,package.json
+npm/lodash,4.17.21,npm,MIT License,frontend-app,yarn.lock
+maven/com.fasterxml.jackson.core/jackson-core,2.15.2,maven,Apache License 2.0,my-api-service,pom.xml
+```
+
+### JSON Format
+```json
+{
+  "npm/lodash": [
+    {
+      "repository": "frontend-app",
+      "file_paths": ["package.json", "yarn.lock"],
+      "version": "4.17.21",
+      "type": "npm",
+      "license": "MIT License"
+    }
+  ],
+  "maven/com.fasterxml.jackson.core/jackson-core": [
+    {
+      "repository": "my-api-service",
+      "file_paths": ["pom.xml"],
+      "version": "2.15.2",
+      "type": "maven",
+      "license": "Apache License 2.0"
+    }
+  ]
+}
+```
+
 ### Text Format
 ```
 DEPENDENCY USAGE REPORT
 
-Dependency: maven/com.fasterxml.jackson.core/jackson-core
-Used in 3 repositories:
-
-  Repository: my-api-service
-    Files: pom.xml, build.gradle
-    Version: 2.15.2
-    Type: maven
-
-  Repository: data-processor
-    Files: pom.xml
-    Version: 2.14.1
-    Type: maven
-
-------------------------------
-
 Dependency: npm/lodash
-Used in 2 repositories:
+License: MIT License
+Used in 1 repositories:
 
   Repository: frontend-app
     Files: package.json, yarn.lock
     Version: 4.17.21
     Type: npm
 
-  Repository: admin-dashboard
-    Files: package.json, package-lock.json
-    Version: 4.17.19
-    Type: npm
+------------------------------
+
+Dependency: maven/com.fasterxml.jackson.core/jackson-core
+License: Apache License 2.0
+Used in 1 repositories:
+
+  Repository: my-api-service
+    Files: pom.xml
+    Version: 2.15.2
+    Type: maven
 
 ------------------------------
 ```
 
-### JSON Format
-```json
-{
-  "maven/com.fasterxml.jackson.core/jackson-core": [
-    {
-      "repository": "my-api-service",
-      "file_paths": ["pom.xml", "build.gradle"],
-      "version": "2.15.2",
-      "type": "maven"
-    },
-    {
-      "repository": "data-processor",
-      "file_paths": ["pom.xml"],
-      "version": "2.14.1",
-      "type": "maven"
-    }
-  ],
-  "npm/lodash": [
-    {
-      "repository": "frontend-app",
-      "file_paths": ["package.json", "yarn.lock"],
-      "version": "4.17.21",
-      "type": "npm"
-    },
-    {
-      "repository": "admin-dashboard",
-      "file_paths": ["package.json", "package-lock.json"],
-      "version": "4.17.19",
-      "type": "npm"
-    }
-  ]
-}
-```
+## Performance Features
+
+- **Asynchronous Processing**: Uses async/await for concurrent API calls
+- **License Caching**: Caches license information to reduce API calls
+- **Rate Limiting**: Automatically handles API rate limits with exponential backoff
+- **Progress Tracking**: Shows real-time progress for large organizations
+- **Statistics**: Optional performance statistics display
 
 ## Limitations
 
-- File path detection uses pattern matching on common dependency files (may not catch all edge cases)
 - Requires SBOM data to be available in Codacy (dependency scanning must be enabled)
 - Rate limited by Codacy API limits
 - File content analysis is performed for each repository, which may increase processing time for large organizations
@@ -178,6 +197,7 @@ The tool includes comprehensive error handling for:
 - Network connectivity issues
 - API rate limits
 - Missing organizations or repositories
+- Malformed dependency data
 
 ## Development
 

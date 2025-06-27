@@ -11,6 +11,8 @@ This version uses async/await patterns and concurrent processing for significant
 import os
 import sys
 import json
+import csv
+import io
 import asyncio
 import aiohttp
 import time
@@ -20,6 +22,9 @@ from dataclasses import dataclass
 from collections import defaultdict
 import click
 from dotenv import load_dotenv
+
+# Import license caching functionality
+from license_cache import LicenseCacheManager, LicenseInfo
 
 # Load environment variables
 load_dotenv()
@@ -32,12 +37,13 @@ class DependencyInfo:
     dependency_name: str
     dependency_version: Optional[str] = None
     dependency_type: Optional[str] = None  # e.g., "maven", "npm", "pip"
+    license_name: Optional[str] = None
 
 class AsyncCodacyAPIClient:
     """Async client for interacting with the Codacy API with performance optimizations and rate limiting"""
     
     def __init__(self, api_token: str, base_url: str = "https://app.codacy.com/api/v3",
-                 max_concurrent: int = 5, request_timeout: int = 30):
+                 max_concurrent: int = 3, request_timeout: int = 60):
         self.api_token = api_token
         self.base_url = base_url
         self.max_concurrent = max_concurrent
@@ -49,11 +55,17 @@ class AsyncCodacyAPIClient:
         self.cache = {}
         self.cache_ttl = 300  # 5 minutes
         
-        # Rate limiting (2500 requests per 5 minutes = ~8.3 requests per second)
-        self.rate_limit_requests = 2400  # Leave some buffer
+        # More conservative rate limiting for file endpoints
+        self.rate_limit_requests = 1000  # Much more conservative
         self.rate_limit_window = 300  # 5 minutes
         self.request_times = []
         self.rate_limit_lock = asyncio.Lock()
+        
+        # Separate rate limiting for file endpoints (more restrictive)
+        self.file_rate_limit_requests = 50  # Very conservative for file endpoints
+        self.file_rate_limit_window = 60  # 1 minute
+        self.file_request_times = []
+        self.file_rate_limit_lock = asyncio.Lock()
         
         # Performance metrics
         self.request_count = 0
@@ -101,35 +113,61 @@ class AsyncCodacyAPIClient:
         """Check if cache entry is still valid"""
         return time.time() - timestamp < self.cache_ttl
     
-    async def _wait_for_rate_limit(self):
+    async def _wait_for_rate_limit(self, is_file_request: bool = False):
         """Wait if we're approaching rate limits"""
-        async with self.rate_limit_lock:
-            current_time = time.time()
-            
-            # Remove old requests outside the window
-            self.request_times = [t for t in self.request_times if current_time - t < self.rate_limit_window]
-            
-            # Check if we need to wait
-            if len(self.request_times) >= self.rate_limit_requests:
-                # Calculate how long to wait
-                oldest_request = min(self.request_times)
-                wait_time = self.rate_limit_window - (current_time - oldest_request)
+        if is_file_request:
+            # Use more restrictive rate limiting for file requests
+            async with self.file_rate_limit_lock:
+                current_time = time.time()
                 
-                if wait_time > 0:
-                    self.rate_limit_delays += 1
-                    click.echo(f"Rate limit reached, waiting {wait_time:.1f} seconds...")
-                    await asyncio.sleep(wait_time)
-            
-            # Record this request
-            self.request_times.append(current_time)
+                # Remove old requests outside the window
+                self.file_request_times = [t for t in self.file_request_times if current_time - t < self.file_rate_limit_window]
+                
+                # Check if we need to wait
+                if len(self.file_request_times) >= self.file_rate_limit_requests:
+                    # Calculate how long to wait
+                    oldest_request = min(self.file_request_times)
+                    wait_time = self.file_rate_limit_window - (current_time - oldest_request)
+                    
+                    if wait_time > 0:
+                        self.rate_limit_delays += 1
+                        click.echo(f"File API rate limit reached, waiting {wait_time:.1f} seconds...")
+                        await asyncio.sleep(wait_time)
+                
+                # Record this request
+                self.file_request_times.append(current_time)
+        else:
+            # Use general rate limiting
+            async with self.rate_limit_lock:
+                current_time = time.time()
+                
+                # Remove old requests outside the window
+                self.request_times = [t for t in self.request_times if current_time - t < self.rate_limit_window]
+                
+                # Check if we need to wait
+                if len(self.request_times) >= self.rate_limit_requests:
+                    # Calculate how long to wait
+                    oldest_request = min(self.request_times)
+                    wait_time = self.rate_limit_window - (current_time - oldest_request)
+                    
+                    if wait_time > 0:
+                        self.rate_limit_delays += 1
+                        click.echo(f"Rate limit reached, waiting {wait_time:.1f} seconds...")
+                        await asyncio.sleep(wait_time)
+                
+                # Record this request
+                self.request_times.append(current_time)
 
     async def _make_request_with_retry(self, method: str, url: str, params: dict = None, 
-                                     json_data: dict = None, max_retries: int = 3) -> dict:
+                                     json_data: dict = None, max_retries: int = 4) -> dict:
         """Make HTTP request with exponential backoff retry for rate limit errors"""
+        # Check if this is a file request for special rate limiting
+        is_file_request = "/files" in url
+        
         for attempt in range(max_retries + 1):
             try:
                 # Wait for rate limit before making request
-                await self._wait_for_rate_limit()
+                await self._wait_for_rate_limit(is_file_request)
                 
                 if method.upper() == "GET":
                     async with self.session.get(url, params=params) as response:
@@ -261,7 +299,19 @@ class AsyncCodacyAPIClient:
         
         body = {"dependencyFullName": dependency_full_name}
         
-        return await self._make_request("POST", url, params, body)
+        result = await self._make_request("POST", url, params, body)
+        
+        # Debug logging for license information in API response
+        if result and "data" in result:
+            for repo in result["data"]:
+                repo_name = repo.get("name", "")
+                licenses = repo.get("licenses", [])
+                if licenses:
+                    click.echo(f"API returned licenses for {dependency_full_name} in {repo_name}: {licenses}", err=True)
+                else:
+                    click.echo(f"No licenses in API response for {dependency_full_name} in {repo_name}", err=True)
+        
+        return result
     
     async def get_repository_files(self, provider: str, organization: str, repository: str,
                                  search_patterns: List[str] = None) -> List[Dict[str, Any]]:
@@ -290,6 +340,7 @@ class AsyncCodacyAPIClient:
                     seen_files.add(file_path)
         
         return all_files
+    
     
     async def _get_repository_files_for_pattern(self, provider: str, organization: str, 
                                               repository: str, pattern: str) -> List[Dict[str, Any]]:
@@ -338,10 +389,12 @@ class AsyncCodacyAPIClient:
 class AsyncDependencyReporter:
     """Main class for async dependency reporting functionality"""
     
-    def __init__(self, api_client: AsyncCodacyAPIClient, batch_size: int = 50):
+    def __init__(self, api_client: AsyncCodacyAPIClient, batch_size: int = 50, 
+                 license_cache_manager: Optional[LicenseCacheManager] = None):
         self.api_client = api_client
         self.batch_size = batch_size
         self.dependencies_data = defaultdict(list)
+        self.license_cache_manager = license_cache_manager
     
     async def scan_organization_dependencies(self, provider: str, organization: str, 
                                            limit: Optional[int] = None) -> Dict[str, List[DependencyInfo]]:
@@ -458,8 +511,67 @@ class AsyncDependencyReporter:
                 dep_version = repo.get("dependencyVersion", "")
                 dep_type = self._extract_dependency_type(dep_name)
                 
+                # Try to get license information from cache first
+                license_name = None
+                if self.license_cache_manager:
+                    cached_license = self.license_cache_manager.get_license_info(
+                        dep_name, dep_version, repo_name
+                    )
+                    if cached_license:
+                        license_name = cached_license.license_string
+                        click.echo(f"Using cached license for {dep_name} in {repo_name}: {license_name}", err=True)
+                
+                # If not in cache, extract from API response
+                if license_name is None:
+                    # Extract license information from the repository response
+                    # The licenses field is an array of license names
+                    licenses = repo.get("licenses", [])
+                    license_names = []
+                    
+                    # Handle various formats for licenses
+                    if isinstance(licenses, list):
+                        for license_item in licenses:
+                            if isinstance(license_item, str) and license_item.strip():
+                                license_names.append(license_item.strip())
+                            elif isinstance(license_item, dict):
+                                # Handle case where license is an object with name field
+                                name = license_item.get("name", "")
+                                if name and isinstance(name, str):
+                                    license_names.append(name.strip())
+                    elif isinstance(licenses, str) and licenses.strip():
+                        license_names = [licenses.strip()]
+                    elif isinstance(licenses, dict):
+                        # Handle case where licenses is a single object
+                        name = licenses.get("name", "")
+                        if name and isinstance(name, str):
+                            license_names.append(name.strip())
+                    
+                    # Remove duplicates and empty strings
+                    license_names = list(set(name for name in license_names if name))
+                    
+                    # Join multiple licenses with comma, or use None if no licenses
+                    license_name = ", ".join(sorted(license_names)) if license_names else None
+                    
+                    # Cache the license information if we have a cache manager
+                    if self.license_cache_manager and license_names:
+                        license_info = LicenseInfo(
+                            dependency_name=dep_name,
+                            dependency_version=dep_version,
+                            license_names=license_names,
+                            repository_name=repo_name,
+                            source="api"
+                        )
+                        self.license_cache_manager.store_license_info(license_info)
+                        click.echo(f"Cached license for {dep_name} in {repo_name}: {license_names}", err=True)
+                    
+                    # Debug logging for license information
+                    if license_names:
+                        click.echo(f"Found licenses for {dep_name} in {repo_name}: {license_names}", err=True)
+                    else:
+                        click.echo(f"No license information found for {dep_name} in {repo_name}", err=True)
+                
                 task = self._process_repository_dependency(
-                    provider, organization, repo_name, dep_name, dep_version, dep_type
+                    provider, organization, repo_name, dep_name, dep_version, dep_type, license_name
                 )
                 repo_tasks.append(task)
             
@@ -482,7 +594,7 @@ class AsyncDependencyReporter:
     
     async def _process_repository_dependency(self, provider: str, organization: str, 
                                            repo_name: str, dep_name: str, dep_version: str, 
-                                           dep_type: str) -> List[DependencyInfo]:
+                                           dep_type: str, license_name: Optional[str] = None) -> List[DependencyInfo]:
         """Process dependency usage in a specific repository"""
         usage_list = []
         
@@ -497,7 +609,8 @@ class AsyncDependencyReporter:
                     file_path=file_path,
                     dependency_name=dep_name,
                     dependency_version=dep_version,
-                    dependency_type=dep_type
+                    dependency_type=dep_type,
+                    license_name=license_name
                 )
                 usage_list.append(dep_info)
         else:
@@ -507,7 +620,8 @@ class AsyncDependencyReporter:
                 file_path="",  # No specific file found
                 dependency_name=dep_name,
                 dependency_version=dep_version,
-                dependency_type=dep_type
+                dependency_type=dep_type,
+                license_name=license_name
             )
             usage_list.append(dep_info)
         
@@ -541,15 +655,26 @@ class AsyncDependencyReporter:
         if not patterns:
             return []
         
-        files = await self.api_client.get_repository_files(provider, organization, repository, patterns)
-        
         found_files = []
-        for file_info in files:
-            file_path = file_info.get("path", "")
-            if file_path:
-                found_files.append(file_path)
         
-        return found_files
+        try:
+            # Search for each pattern individually (like the original sync version)
+            for pattern in patterns:
+                # Add a small delay between requests to avoid overwhelming the API
+                await asyncio.sleep(0.2)
+                
+                files = await self.api_client.get_repository_files(provider, organization, repository, [pattern])
+                
+                for file_info in files:
+                    file_path = file_info.get("path", "")
+                    if file_path and file_path not in found_files:
+                        found_files.append(file_path)
+            
+            return found_files
+        except Exception as e:
+            # If file fetching fails, return empty list to avoid breaking the whole process
+            click.echo(f"Warning: Could not fetch files for {repository}: {e}", err=True)
+            return []
     
     def generate_report(self, dependencies: Dict[str, List[DependencyInfo]], 
                        output_format: str = "json") -> str:
@@ -558,6 +683,8 @@ class AsyncDependencyReporter:
             return self._generate_json_report(dependencies)
         elif output_format == "text":
             return self._generate_text_report(dependencies)
+        elif output_format == "csv":
+            return self._generate_csv_report(dependencies)
         else:
             raise ValueError(f"Unsupported output format: {output_format}")
     
@@ -568,12 +695,14 @@ class AsyncDependencyReporter:
         for dep_name, usages in dependencies.items():
             report_data[dep_name] = []
             for usage in usages:
-                report_data[dep_name].append({
+                usage_data = {
                     "repository": usage.repository_name,
                     "file_path": usage.file_path,
                     "version": usage.dependency_version,
-                    "type": usage.dependency_type
-                })
+                    "type": usage.dependency_type,
+                    "license_name": usage.license_name
+                }
+                report_data[dep_name].append(usage_data)
         
         return json.dumps(report_data, indent=2)
     
@@ -595,6 +724,8 @@ class AsyncDependencyReporter:
                     lines.append(f"    Version: {usage.dependency_version}")
                 if usage.dependency_type:
                     lines.append(f"    Type: {usage.dependency_type}")
+                if usage.license_name:
+                    lines.append(f"    License: {usage.license_name}")
                 if usage.file_path:
                     lines.append(f"    File: {usage.file_path}")
                 lines.append("")
@@ -603,22 +734,60 @@ class AsyncDependencyReporter:
             lines.append("")
         
         return "\n".join(lines)
+    
+    def _generate_csv_report(self, dependencies: Dict[str, List[DependencyInfo]]) -> str:
+        """Generate CSV format report"""
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        headers = [
+            "Dependency Name",
+            "Version", 
+            "Type",
+            "License Name",
+            "Repository",
+            "File Path"
+        ]
+        writer.writerow(headers)
+        
+        # Write data rows - one row per dependency usage
+        for dep_name, usages in sorted(dependencies.items()):
+            for usage in usages:
+                row = [
+                    usage.dependency_name or "",
+                    usage.dependency_version or "",
+                    usage.dependency_type or "",
+                    usage.license_name or "",
+                    usage.repository_name or "",
+                    usage.file_path or ""
+                ]
+                writer.writerow(row)
+        
+        return output.getvalue()
 
 @click.command()
 @click.option("--provider", "-p", default="gh", help="Git provider (gh, gl, bb)")
 @click.option("--organization", "-o", required=True, help="Organization name")
 @click.option("--api-token", "-t", help="Codacy API token (or set CODACY_API_TOKEN env var)")
-@click.option("--output", "-f", type=click.Choice(["json", "text"]), default="text", 
+@click.option("--output", "-f", type=click.Choice(["json", "text", "csv"]), default="text", 
               help="Output format")
 @click.option("--output-file", help="Output file path (default: stdout)")
 @click.option("--limit", "-l", type=int, help="Limit the number of dependencies to process (useful for testing)")
-@click.option("--max-concurrent", type=int, default=5, help="Maximum concurrent requests (default: 5, reduced for rate limiting)")
-@click.option("--batch-size", type=int, default=50, help="Dependencies to process per batch (default: 50)")
-@click.option("--request-timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
+@click.option("--max-concurrent", type=int, default=2, help="Maximum concurrent requests (default: 2, reduced for rate limiting)")
+@click.option("--batch-size", type=int, default=10, help="Dependencies to process per batch (default: 10)")
+@click.option("--request-timeout", type=int, default=60, help="Request timeout in seconds (default: 60)")
 @click.option("--show-stats", is_flag=True, help="Show performance statistics")
+@click.option("--enable-license-cache", is_flag=True, default=True, help="Enable license caching (default: enabled)")
+@click.option("--cache-dir", default=".cache", help="Directory for license cache storage (default: .cache)")
+@click.option("--cache-ttl-days", type=int, default=7, help="License cache TTL in days (default: 7)")
+@click.option("--clear-cache", is_flag=True, help="Clear license cache before running")
+@click.option("--show-cache-stats", is_flag=True, help="Show license cache statistics")
 def main(provider: str, organization: str, api_token: Optional[str], 
          output: str, output_file: Optional[str], limit: Optional[int],
-         max_concurrent: int, batch_size: int, request_timeout: int, show_stats: bool):
+         max_concurrent: int, batch_size: int, request_timeout: int, show_stats: bool,
+         enable_license_cache: bool, cache_dir: str, cache_ttl_days: int, 
+         clear_cache: bool, show_cache_stats: bool):
     """
     Async Codacy Dependency Reporter - High Performance Version
     
@@ -643,14 +812,47 @@ def main(provider: str, organization: str, api_token: Optional[str],
     async def run_scan():
         start_time = time.time()
         
+        # Initialize license cache manager if enabled
+        license_cache_manager = None
+        if enable_license_cache:
+            try:
+                license_cache_manager = LicenseCacheManager(
+                    cache_dir=cache_dir,
+                    ttl_days=cache_ttl_days,
+                    enable_persistent=True
+                )
+                
+                # Clear cache if requested
+                if clear_cache:
+                    memory_cleared, persistent_cleared = license_cache_manager.clear_cache()
+                    click.echo(f"Cleared license cache: {memory_cleared} memory entries, {persistent_cleared} persistent entries")
+                
+                # Clean up expired entries
+                expired_removed = license_cache_manager.cleanup_expired()
+                if expired_removed > 0:
+                    click.echo(f"Removed {expired_removed} expired license cache entries")
+                
+                click.echo(f"License caching enabled (TTL: {cache_ttl_days} days, Cache dir: {cache_dir})")
+                
+            except Exception as e:
+                click.echo(f"Warning: Failed to initialize license cache: {e}", err=True)
+                click.echo("Continuing without license caching...", err=True)
+                license_cache_manager = None
+        else:
+            click.echo("License caching disabled")
+        
         async with AsyncCodacyAPIClient(
             api_token, 
             max_concurrent=max_concurrent,
             request_timeout=request_timeout
         ) as api_client:
             
-            # Initialize reporter
-            reporter = AsyncDependencyReporter(api_client, batch_size=batch_size)
+            # Initialize reporter with license cache manager
+            reporter = AsyncDependencyReporter(
+                api_client, 
+                batch_size=batch_size,
+                license_cache_manager=license_cache_manager
+            )
             
             # Scan dependencies
             dependencies = await reporter.scan_organization_dependencies(provider, organization, limit)
@@ -674,22 +876,51 @@ def main(provider: str, organization: str, api_token: Optional[str],
             end_time = time.time()
             total_time = end_time - start_time
             
-            if show_stats:
-                stats = api_client.get_performance_stats()
+            if show_stats or show_cache_stats:
                 click.echo("\n" + "=" * 50)
                 click.echo("PERFORMANCE STATISTICS")
                 click.echo("=" * 50)
                 click.echo(f"Total execution time: {total_time:.2f}s")
-                click.echo(f"Total API requests: {stats['total_requests']}")
-                click.echo(f"Cache hits: {stats['cache_hits']}")
-                click.echo(f"Cache hit rate: {stats['cache_hit_rate']}")
-                click.echo(f"Rate limit delays: {stats['rate_limit_delays']}")
-                click.echo(f"Retry attempts: {stats['retry_attempts']}")
-                click.echo(f"Requests per second: {stats['requests_per_second']}")
-                click.echo(f"Dependencies found: {len(dependencies)}")
                 
-                total_usages = sum(len(usages) for usages in dependencies.values())
-                click.echo(f"Total dependency usages: {total_usages}")
+                if show_stats:
+                    stats = api_client.get_performance_stats()
+                    click.echo(f"Total API requests: {stats['total_requests']}")
+                    click.echo(f"Cache hits: {stats['cache_hits']}")
+                    click.echo(f"Cache hit rate: {stats['cache_hit_rate']}")
+                    click.echo(f"Rate limit delays: {stats['rate_limit_delays']}")
+                    click.echo(f"Retry attempts: {stats['retry_attempts']}")
+                    click.echo(f"Requests per second: {stats['requests_per_second']}")
+                    click.echo(f"Dependencies found: {len(dependencies)}")
+                    
+                    total_usages = sum(len(usages) for usages in dependencies.values())
+                    click.echo(f"Total dependency usages: {total_usages}")
+                
+                # Show license cache statistics
+                if license_cache_manager and (show_stats or show_cache_stats):
+                    cache_stats = license_cache_manager.get_comprehensive_stats()
+                    click.echo("\nLICENSE CACHE STATISTICS")
+                    click.echo("-" * 30)
+                    
+                    memory_stats = cache_stats["memory_cache"]
+                    click.echo(f"Memory cache entries: {memory_stats['total_entries']}")
+                    click.echo(f"Memory cache hits: {memory_stats['cache_hits']}")
+                    click.echo(f"Memory cache hit rate: {memory_stats['hit_rate']}")
+                    
+                    if cache_stats["persistent_enabled"] and cache_stats["persistent_cache"]:
+                        persistent_stats = cache_stats["persistent_cache"]
+                        click.echo(f"Persistent cache entries: {persistent_stats['valid_entries']}")
+                        click.echo(f"Expired entries: {persistent_stats['expired_entries']}")
+                        click.echo(f"Unique dependencies cached: {persistent_stats['unique_dependencies']}")
+                        cache_size_kb = persistent_stats['cache_file_size'] / 1024
+                        click.echo(f"Cache file size: {cache_size_kb:.1f} KB")
+                    
+                    click.echo(f"API calls saved by caching: {cache_stats['api_calls_saved']}")
+                    
+                    # Calculate cache effectiveness
+                    if cache_stats['api_calls_saved'] > 0:
+                        total_license_requests = cache_stats['api_calls_saved'] + memory_stats['cache_misses']
+                        cache_effectiveness = (cache_stats['api_calls_saved'] / max(total_license_requests, 1)) * 100
+                        click.echo(f"License cache effectiveness: {cache_effectiveness:.1f}%")
     
     try:
         asyncio.run(run_scan())
@@ -701,4 +932,4 @@ def main(provider: str, organization: str, api_token: Optional[str],
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main()  # pylint: disable=no-value-for-parameter

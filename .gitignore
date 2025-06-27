@@ -1,35 +1,6 @@
-# Dependency Reporter - Comprehensive .gitignore
-# This configuration ignores everything by default and only allows explicitly defined files
+# Dependency Reporter .gitignore
 
-# IGNORE EVERYTHING BY DEFAULT
-*
-
-# EXPLICITLY ALLOW CORE PROJECT FILES
-!.gitignore
-!README.md
-!requirements.txt
-
-# EXPLICITLY ALLOW MAIN SCRIPTS
-!dependency_reporter.py
-!dependency_reporter_async.py
-
-# EXPLICITLY ALLOW TESTING AND EXAMPLES
-!performance_test.py
-!example_usage.py
-
-# EXPLICITLY ALLOW DOCUMENTATION
-!README_PERFORMANCE.md
-
-# EXPLICITLY ALLOW CONFIGURATION FILES
-!.env.example
-
-# EXPLICITLY ALLOW SAMPLE OUTPUT (if needed for reference)
-!report.json
-
-# ALLOW DIRECTORIES (but contents will still be filtered by above rules)
-!*/
-
-# COMMON DEVELOPMENT FILES TO IGNORE (even if explicitly created)
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -51,11 +22,8 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-*.manifest
-*.spec
-pip-log.txt
-pip-delete-this-directory.txt
-htmlcov/
+
+# Testing
 .tox/
 .nox/
 .coverage
@@ -68,21 +36,8 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
-*.mo
-*.pot
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-instance/
-.webassets-cache
-.scrapy
-docs/_build/
-.pybuilder/
-target/
-.ipynb_checkpoints
-profile_default/
-ipython_config.py
+
+# Environment
 .env
 .venv
 env/
@@ -90,35 +45,14 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-.spyderproject
-.spyproject
-.ropeproject
-/site
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-cython_debug/
+
+# IDE
 .idea/
-.abstra/
 .vscode/
-.ruff_cache/
-.pypirc
-.cursorignore
-.cursorindexingignore
+*.sublime-project
+*.sublime-workspace
 
-# IGNORE GENERATED REPORTS AND TEMPORARY FILES
-dependencies_report_*.json
-performance_test_results_*.txt
-*.tmp
-*.temp
-*.bak
-*.swp
-*.swo
-*~
-
-# IGNORE OS-SPECIFIC FILES
+# OS
 .DS_Store
 .DS_Store?
 ._*
@@ -128,10 +62,17 @@ ehthumbs.db
 Thumbs.db
 desktop.ini
 
-# IGNORE EDITOR-SPECIFIC FILES
-*.sublime-project
-*.sublime-workspace
-.vscode/settings.json
-.vscode/tasks.json
-.vscode/launch.json
-.vscode/extensions.json
+# Generated reports and cache
+*.csv
+*.json
+.cache/
+dependencies_report_*.json
+test_output_*.csv
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
